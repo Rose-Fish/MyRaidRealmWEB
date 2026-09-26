@@ -52,7 +52,9 @@ import {
 import { fetchOpenAiCompatibleModelIds } from '../../src/utils/openAiCompatibleModels';
 import {
   applyStandalonePromptMacroReplacements,
+  applyStandaloneTavernMacroState,
   buildStandaloneCurrentStatDataBlock,
+  createStandaloneTavernMacroState,
 } from '../../runtime/standalonePromptUtils';
 import {
   attachRegisteredWorldbooksToBuiltInPresets,
@@ -469,6 +471,20 @@ function testStandalonePromptMacroReplacementHelpers(): void {
   );
 
   assert.equal(applyStandalonePromptMacroReplacements('user={{user}}', { statData: {} }), 'user=玩家');
+}
+
+function testStandaloneTavernMacroState(): void {
+  const state = createStandaloneTavernMacroState();
+  const first = applyStandaloneTavernMacroState(
+    '{{setvar::schema::ROOT}}value={{getvar::schema}}',
+    state,
+  );
+  assert.equal(first, 'value=ROOT');
+
+  const second = applyStandaloneTavernMacroState('{{addvar::schema::-BODY}} {{getvar::schema}}', state);
+  assert.equal(second, ' ROOT-BODY');
+
+  assert.equal(applyStandaloneTavernMacroState('{{getvar::missing}}', state), '');
 }
 
 function testPriorSummariesOutsideRecentWindowAreInjected(): void {
@@ -4871,6 +4887,7 @@ async function run(): Promise<void> {
     ['supports raw interpolation without html escaping', testSupportsRawInterpolationWithoutHtmlEscaping],
     ['supports getvar defaults and lodash random', testSupportsGetvarDefaultsAndLodashRandom],
     ['standalone prompt macro helpers', testStandalonePromptMacroReplacementHelpers],
+    ['standalone Tavern variable macro state', testStandaloneTavernMacroState],
     ['prior summaries outside recent window are injected', testPriorSummariesOutsideRecentWindowAreInjected],
     ['stage summary replaces archived prior summaries', testStageSummaryReplacesArchivedPriorSummaries],
     ['stage summary threshold normalization', testStageSummaryThresholdNormalization],

@@ -343,8 +343,9 @@ export const useMessagesStore = defineStore('messages', () => {
   ): MessageRecord | null {
     const { isPartial = false, isStreaming: isStreamingRecord = true } = options;
     const parsedReply = parseStreamingTaggedAssistantReply(rawContent);
+    const contentText = parsedReply.contentText.trim() || parsedReply.fallbackContentText.trim();
     const hasDisplayContent = Boolean(
-      parsedReply.contentText || parsedReply.thinkContent || parsedReply.summaryContent || parsedReply.updateContent,
+      contentText || parsedReply.thinkContent || parsedReply.summaryContent || parsedReply.updateContent,
     );
 
     if (!hasDisplayContent) {
@@ -360,12 +361,12 @@ export const useMessagesStore = defineStore('messages', () => {
       message_id: messageId,
       role: 'assistant',
       raw_content: rawContent,
-      content_text: parsedReply.contentText,
+      content_text: contentText,
       think_content: parsedReply.thinkContent,
       summary_content: parsedReply.summaryContent,
       update_content: parsedReply.updateContent,
       action_options: parsedReply.actionOptions,
-      formatted: formatMessageContent(parsedReply.contentText, 'assistant', messageId),
+      formatted: formatMessageContent(contentText, 'assistant', messageId),
       is_streaming: isStreamingRecord,
       is_partial: isPartial,
       createdAt: new Date().toISOString(),

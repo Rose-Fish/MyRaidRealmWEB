@@ -35,7 +35,12 @@ import {
 import { formatMessageContentForDisplay } from '../src/utils/messageFormatting';
 import { normalizeLineEndingsTrimmed as normalizeLineEndings } from '../src/utils/textNormalize';
 import { applyVariableUpdatePatch, parseVariableUpdatePatch } from '../src/utils/variableUpdate';
-import { applyStandalonePromptMacroReplacements, buildStandaloneCurrentStatDataBlock } from './standalonePromptUtils';
+import {
+  applyStandalonePromptMacroReplacements,
+  applyStandaloneTavernMacroState,
+  buildStandaloneCurrentStatDataBlock,
+  createStandaloneTavernMacroState,
+} from './standalonePromptUtils';
 
 type StandaloneStatData = ReturnType<typeof Schema.parse>;
 
@@ -309,9 +314,11 @@ function buildStandaloneMainProtocolBlock(localContentBlocks: string[], mainPres
 2. 回复时必须输出且只输出一段标签化结果，不要使用 Markdown 代码块。
 3. 结果必须包含且仅包含一个 <contenttext> 正文块。
 4. 可以按需输出 <summary>、<analysis_block>、<action_options>。
-5. <action_options> 内请给出 3 到 5 行可选行动，每行以 “1.”、“2.” 这样的编号开头。
-6. 不要输出 <UpdateVariable>；变量变化会由后续专用流程单独处理。
-7. 不要输出与标签协议无关的解释性前言。
+5. <analysis_block> 结束后，下一段必须立即输出 <contenttext>；标签外不得出现正文或解释性文字。
+6. <summary> 必须在 </contenttext> 之后，且只能放总结；<action_options> 必须在正文结束后，且只能放行动选项。
+7. <action_options> 内请给出 3 到 5 行可选行动，每行以 “1.”、“2.” 这样的编号开头。
+8. 不要输出 <UpdateVariable>；变量变化会由后续专用流程单独处理。
+9. 不要输出与标签协议无关的解释性前言。
 
 标签协议示例：
 <contenttext>
@@ -428,6 +435,7 @@ function buildStandaloneOrderedMainMessages(input: {
 }): StandaloneProviderChatMessage[] {
   const orderedPrompts = resolveOrderedStandalonePresetPrompts();
   const messages: StandaloneProviderChatMessage[] = [];
+  const tavernMacroState = createStandaloneTavernMacroState();
   let latestUserInjected = false;
   let statDataInjected = false;
   let worldbookInjected = false;
@@ -453,7 +461,10 @@ function buildStandaloneOrderedMainMessages(input: {
     if (prompt.identifier === 'main') {
       const content =
         typeof prompt.content === 'string'
-          ? normalizeStandalonePresetPromptContent(prompt.content, input.statData)
+          ? normalizeStandalonePresetPromptContent(
+              applyStandaloneTavernMacroState(prompt.content, tavernMacroState),
+              input.statData,
+            )
           : '';
       if (!content) {
         return;
@@ -504,7 +515,12 @@ function buildStandaloneOrderedMainMessages(input: {
     }
 
     const directContent =
-      typeof prompt.content === 'string' ? normalizeStandalonePresetPromptContent(prompt.content, input.statData) : '';
+      typeof prompt.content === 'string'
+        ? normalizeStandalonePresetPromptContent(
+            applyStandaloneTavernMacroState(prompt.content, tavernMacroState),
+            input.statData,
+          )
+        : '';
     const resolvedContent = directContent.trim();
 
     if (!resolvedContent) {
@@ -909,7 +925,7 @@ function buildAssistantMessagePayload(
   debugTrace?: StandaloneAssistantDebugTrace,
   model?: string,
 ) {
-  const contentText = parsedReply.contentText.trim() || rawContent.trim();
+  const contentText = parsedReply.contentText.trim() || parsedReply.fallbackContentText.trim() || rawContent.trim();
   const createdAt = new Date().toISOString();
 
   return {

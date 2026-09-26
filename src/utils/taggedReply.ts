@@ -1,6 +1,8 @@
 export interface ParsedTaggedAssistantReply {
   rawContent: string;
   contentText: string;
+  /** 已移除已知辅助标签后的正文兜底文本 */
+  fallbackContentText: string;
   thinkContent: string | null;
   summaryContent: string | null;
   updateContent: string | null;
@@ -78,11 +80,16 @@ export function parseTaggedAssistantReply(rawContent: string): ParsedTaggedAssis
   working = summaryTags.cleaned;
 
   const updateTags = extractTagContents(working, /<UpdateVariable>([\s\S]*?)<\/UpdateVariable>/gi);
+  working = updateTags.cleaned;
+
+  const actionOptionsTags = extractTagContents(working, /<action_options\b[^>]*>([\s\S]*?)<\/action_options>/gi);
+  working = actionOptionsTags.cleaned;
   const { updateAnalysis, updateJsonPatchText } = parseUpdateVariableDetails(updateTags.content);
 
   return {
     rawContent,
     contentText: extractTaggedContentText(rawContent),
+    fallbackContentText: working.trim(),
     thinkContent: thinkingTags.content,
     summaryContent: summaryTags.content,
     updateContent: updateTags.content,

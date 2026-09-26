@@ -18,8 +18,8 @@
 
 ## 宏
 
-🔴 **宏只有一张表**，实现在 `runtime/standalonePromptUtils.ts` 的
-`applyStandalonePromptMacroReplacements()`。全项目 7 个宏：
+🔴 **固定运行时宏只有一张表**，实现在 `runtime/standalonePromptUtils.ts` 的
+`applyStandalonePromptMacroReplacements()`。全项目 7 个固定宏：
 
 | 宏                                       | 解析为                | 取值来源                                             |
 | ---------------------------------------- | --------------------- | ---------------------------------------------------- |
@@ -30,6 +30,8 @@
 | `{{personality}}`                        | 角色性格              | 固定文案                                             |
 | `{{lastChatMessage}}`                    | 上一条消息            | 固定文案                                             |
 | `{{format_message_variable::stat_data}}` | 完整 `stat_data` JSON | 运行时快照                                           |
+
+预设 prompt 另外支持一组**单次组装作用域**的酒馆变量宏：`{{setvar::key::value}}`、`{{addvar::key::value}}`、`{{getvar::key}}`、`{{trim}}` 与 `{{// comment}}`。它们按预设顺序求值，只在当前请求组装期间存在，不写入 `stat_data` 或存档；复杂的酒馆宏仍会原样保留。
 
 🔴 **快照宏（最后一条）必须排在替换链的最后。** 它注入的是整个 JSON，
 如果排在前面，后面任何替换都可能命中 JSON 里的内容并二次替换。

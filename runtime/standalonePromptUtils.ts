@@ -1,5 +1,7 @@
 type StandaloneMacroRecord = Record<string, unknown>;
 
+export type StandaloneTavernMacroState = Map<string, string>;
+
 const STANDALONE_PROMPT_MACRO_FALLBACKS = {
   user: '玩家',
   char: '当前角色',
@@ -64,6 +66,85 @@ export function applyStandalonePromptMacroReplacements(
     .replace(/\{\{\s*personality\s*\}\}/gi, STANDALONE_PROMPT_MACRO_FALLBACKS.personality)
     .replace(/\{\{\s*lastChatMessage\s*\}\}/gi, STANDALONE_PROMPT_MACRO_FALLBACKS.lastChatMessage)
     .replace(/\{\{\s*format_message_variable::stat_data\s*\}\}/gi, JSON.stringify(input.statData ?? {}, null, 2));
+}
+
+function splitStandaloneTavernMacroArguments(value: string): string[] {
+  return value.split('::').map(part => part.trim());
+}
+
+function findStandaloneTavernMacroEnd(template: string, startIndex: number): number {
+  let depth = 0;
+  for (let index = startIndex; index < template.length - 1; index += 1) {
+    const pair = template.slice(index, index + 2);
+    if (pair === '{{') {
+      depth += 1;
+      index += 1;
+    } else if (pair === '}}') {
+      depth -= 1;
+      if (depth === 0) {
+        return index;
+      }
+      index += 1;
+    }
+  }
+  return -1;
+}
+
+function resolveStandaloneTavernMacroValue(value: string, state: StandaloneTavernMacroState, depth = 0): string {
+  if (depth >= 10 || !value.includes('{{')) {
+    return value;
+  }
+
+  return applyStandaloneTavernMacroState(value, state, depth + 1);
+}
+
+export function createStandaloneTavernMacroState(): StandaloneTavernMacroState {
+  return new Map();
+}
+
+export function applyStandaloneTavernMacroState(
+  template: string,
+  state: StandaloneTavernMacroState,
+  depth = 0,
+): string {
+  let output = '';
+  let cursor = 0;
+
+  while (cursor < template.length) {
+    const startIndex = template.indexOf('{{', cursor);
+    if (startIndex === -1) {
+      output += template.slice(cursor);
+      break;
+    }
+
+    output += template.slice(cursor, startIndex);
+    const endIndex = findStandaloneTavernMacroEnd(template, startIndex);
+    if (endIndex === -1) {
+      output += template.slice(startIndex);
+      break;
+    }
+
+    const body = template.slice(startIndex + 2, endIndex).trim();
+    const setMatch = body.match(/^setvar::([\s\S]*)$/i);
+    const addMatch = body.match(/^addvar::([\s\S]*)$/i);
+    const getMatch = body.match(/^getvar::([^\s][\s\S]*?)$/i);
+
+    if (setMatch || addMatch) {
+      const [key, ...valueParts] = splitStandaloneTavernMacroArguments((setMatch ?? addMatch)![1]!);
+      if (key) {
+        const value = valueParts.join('::').trim();
+        state.set(key, addMatch ? `${state.get(key) ?? ''}${value}` : value);
+      }
+    } else if (getMatch) {
+      output += resolveStandaloneTavernMacroValue(state.get(getMatch[1]!.trim()) ?? '', state, depth);
+    } else if (!/^trim$/i.test(body) && !/^\/\//.test(body)) {
+      output += template.slice(startIndex, endIndex + 2);
+    }
+
+    cursor = endIndex + 2;
+  }
+
+  return output;
 }
 
 export function buildStandaloneCurrentStatDataBlock(statData: unknown): string {
