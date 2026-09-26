@@ -91,6 +91,8 @@ export type StandaloneVariableUpdatePhaseOutcome = {
 
 const STANDALONE_VARIABLE_UPDATE_TIMEOUT_MS = 60_000;
 const STANDALONE_VARIABLE_UPDATE_TIMEOUT_ERROR_MESSAGE = '变量更新补写超时，请稍后重试。';
+/** 补丁「拿到块但应用失败」时，携带错误回执向辅助 API 纠错重试的次数上限 */
+const STANDALONE_VARIABLE_UPDATE_APPLY_RETRY_LIMIT = 1;
 
 export async function runStandaloneVariableUpdatePass(input: {
   /** 主 API 候选，按顺序尝试 */
@@ -109,7 +111,6 @@ export async function runStandaloneVariableUpdatePass(input: {
   localContentCustomEntries?: LocalContentEntryConfig[];
   selectedPreset?: PresetConfig | null;
 }): Promise<StandaloneVariableUpdatePhaseOutcome> {
-  const assistantContentText = input.targetAssistantMessage.content_text.trim();
   const sanitizedAssistantRawContent = normalizeLineEndings(
     stripUpdateVariableBlocks(input.targetAssistantMessage.raw_content),
   );
@@ -129,50 +130,26 @@ export async function runStandaloneVariableUpdatePass(input: {
   activeStandaloneTurnController = controller;
 
   try {
-    const secondPassResult = await requestVariableUpdateSecondPassWithTimeout(
-      {
-        mainApis: input.mainApis,
-        assistantApis: input.assistantApis,
-        autoRetry: input.autoRetry,
-        statData: input.statData,
-        messages: input.messages,
-        latestUserMessage: input.latestUserMessage,
-        worldDifficulty: input.worldDifficulty,
-        localContentEnabledMap: input.localContentEnabledMap,
-        localContentBuiltinRouteOverrides: input.localContentBuiltinRouteOverrides,
-        localContentCustomEntries: input.localContentCustomEntries,
-        selectedPreset: input.selectedPreset,
-      },
-      assistantContentText,
-      controller.signal,
-    );
+    const secondPassOutcome = await runSecondPassVariableUpdateWithApplyRetry({
+      turnInput: input,
+      baseRawReply: sanitizedAssistantRawContent,
+      signal: controller.signal,
+      baseStatData: input.statData,
+    });
 
-    variableUpdateApiLabel = secondPassResult.usedApiLabel;
-    if (secondPassResult.debugTrace) {
-      debugTrace = mergeStandaloneAssistantDebugTrace(debugTrace, {
-        variable_update_pass: secondPassResult.debugTrace,
-      });
-    }
+    variableUpdateApiLabel = secondPassOutcome.variableUpdateApiLabel;
+    debugTrace = mergeStandaloneAssistantDebugTrace(debugTrace, {
+      variable_update_pass: secondPassOutcome.debugTrace?.variable_update_pass,
+    });
 
-    if (!secondPassResult.updateBlock) {
-      variableUpdateWarning = secondPassResult.warning ?? '补写变量更新失败';
-      variableUpdateStatus = variableUpdateWarning ? 'failed' : 'skipped';
+    if (secondPassOutcome.applyResult) {
+      applyResult = secondPassOutcome.applyResult;
+      effectiveRawReply = secondPassOutcome.effectiveRawReply ?? sanitizedAssistantRawContent;
+      variableUpdateWarning = null;
+      variableUpdateStatus = secondPassOutcome.status;
     } else {
-      const mergedRawReply = replaceOrAppendUpdateVariableBlock(
-        sanitizedAssistantRawContent,
-        secondPassResult.updateBlock,
-      );
-      const mergedApplyResult = applyVariableUpdateFromReply(input.statData, mergedRawReply);
-
-      if (mergedApplyResult.errorMessage) {
-        variableUpdateWarning = mergedApplyResult.errorMessage;
-        variableUpdateStatus = 'failed';
-      } else {
-        applyResult = mergedApplyResult;
-        effectiveRawReply = mergedRawReply;
-        variableUpdateWarning = null;
-        variableUpdateStatus = applyResult.variableUpdateApplied ? 'success' : 'skipped';
-      }
+      variableUpdateWarning = secondPassOutcome.warning;
+      variableUpdateStatus = secondPassOutcome.status;
     }
 
     const mainApiLabel = input.mainApis[0] ? toApiLabel(input.mainApis[0]) : '';
@@ -259,6 +236,15 @@ type VariableUpdateSecondPassResult = {
   warning: string | null;
   usedApiLabel: string | null;
   debugTrace?: StandaloneAiDebugPassTrace;
+};
+
+/**
+ * 上一轮补丁「拿到了 <UpdateVariable> 块、但逐条应用时失败」的纠错回执。
+ * 重试时注入二段提示词，让辅助 API 修正路径/写法后重新输出整份补丁。
+ */
+type VariableUpdateApplyRetryFeedback = {
+  errorMessage: string;
+  failedPatchText: string | null;
 };
 
 type StandaloneVariableUpdatePromptSections = {
@@ -721,6 +707,8 @@ export function buildVariableUpdateSecondPassPrompt(input: {
   /** 玩家在设置里手动添加的条目；没选预设时靠它把内容送进提示词 */
   localContentCustomEntries?: LocalContentEntryConfig[];
   selectedPreset?: PresetConfig | null;
+  /** 纠错重试时携带的上一轮失败回执；首次请求为空 */
+  applyRetryFeedback?: VariableUpdateApplyRetryFeedback | null;
 }): StandalonePromptMessagesBundle {
   const promptSections = buildStandaloneVariableUpdatePromptSections(input);
   return {
@@ -772,6 +760,8 @@ function buildStandaloneVariableUpdatePromptSections(input: {
   /** 玩家在设置里手动添加的条目；没选预设时靠它把内容送进提示词 */
   localContentCustomEntries?: LocalContentEntryConfig[];
   selectedPreset?: PresetConfig | null;
+  /** 纠错重试时携带的上一轮失败回执；首次请求为空 */
+  applyRetryFeedback?: VariableUpdateApplyRetryFeedback | null;
 }): StandaloneVariableUpdatePromptSections {
   const renderContext = {
     statData: input.statData,
@@ -832,6 +822,21 @@ function buildStandaloneVariableUpdatePromptSections(input: {
 - 不要输出空的 <JSONPatch>；本回合至少包含上述商城刷新补丁。
 `)
     : '';
+  // 纠错重试回执：上一轮补丁拿到了块、但逐条应用失败。必须放在元指令最顶部，
+  // 让模型先看到失败原因与原补丁，再重新输出修正后的整份补丁。
+  const applyRetryFeedback = input.applyRetryFeedback ?? null;
+  const applyRetryDirective = applyRetryFeedback
+    ? normalizeLineEndings(`
+[最高优先级任务 · 补丁纠错重试]
+你上一次输出的变量更新补丁在应用时失败，本次必须修正后重新输出。
+失败原因：${applyRetryFeedback.errorMessage}
+上一次的补丁内容：
+${applyRetryFeedback.failedPatchText ?? '（无法提取，请参照失败原因自查）'}
+硬性要求：
+- 参照最上方 [当前变量快照 stat_data] 逐字核对每个 path：replace/delta/remove 的目标必须真实存在，新建条目必须用 insert，路径中的对象键要逐字复制快照里已有的键。
+- 本次仍然输出完整的一份 <UpdateVariable>（一个 <Analysis> + 一个 <JSONPatch>），不要只输出 diff 或解释。
+`)
+    : '';
   const metaSystemPrompt = normalizeLineEndings(`
 [Meta.System]
 [元命令]
@@ -839,7 +844,7 @@ function buildStandaloneVariableUpdatePromptSections(input: {
 不要输出剧情
 上文中的剧情是最新,但变量是该剧情发生之前的状态
 按照变量输出格式中的要求,在本次回复中更新变量
-${shopRefreshDirective ? `\n${shopRefreshDirective}\n` : ''}
+${applyRetryDirective ? `\n${applyRetryDirective}\n` : ''}${shopRefreshDirective ? `\n${shopRefreshDirective}\n` : ''}
 硬性要求：
 1. 只输出且必须输出一个 <UpdateVariable> 块。
 2. <UpdateVariable> 内必须有且只有一个 <Analysis> 和一个 <JSONPatch>。
@@ -915,6 +920,12 @@ function extractUpdateVariableBlock(text: string): string | null {
   return match?.[0]?.trim() ?? null;
 }
 
+/** 从已拿到的 <UpdateVariable> 块里提取 <JSONPatch> 原文，供纠错回执展示；提取不到返回 null。 */
+function extractJsonPatchTextFromUpdateBlock(updateBlock: string): string | null {
+  const match = updateBlock.match(/<JSONPatch>([\s\S]*?)<\/JSONPatch>/i);
+  return match?.[1]?.trim() ?? null;
+}
+
 function stripUpdateVariableBlocks(text: string): string {
   return text.replace(/\s*<UpdateVariable>[\s\S]*?<\/UpdateVariable>\s*/gi, '\n').trim();
 }
@@ -948,6 +959,7 @@ async function requestVariableUpdateSecondPass(
   input: StandaloneLocalTurnInput,
   assistantContentText: string,
   signal: AbortSignal,
+  applyRetryFeedback: VariableUpdateApplyRetryFeedback | null = null,
 ): Promise<VariableUpdateSecondPassResult> {
   const secondPassPrompt = buildVariableUpdateSecondPassPrompt({
     statData: input.statData,
@@ -959,6 +971,7 @@ async function requestVariableUpdateSecondPass(
     localContentBuiltinRouteOverrides: input.localContentBuiltinRouteOverrides,
     localContentCustomEntries: input.localContentCustomEntries,
     selectedPreset: input.selectedPreset ?? null,
+    applyRetryFeedback,
   });
 
   const candidateApis = limitApiCandidates(resolveConfiguredAssistantApis(input.assistantApis), input.autoRetry);
@@ -1012,6 +1025,7 @@ async function requestVariableUpdateSecondPassWithTimeout(
   input: StandaloneLocalTurnInput,
   assistantContentText: string,
   signal: AbortSignal,
+  applyRetryFeedback: VariableUpdateApplyRetryFeedback | null = null,
 ): Promise<VariableUpdateSecondPassResult> {
   const timedSignal = createTimedAbortSignal({
     parentSignal: signal,
@@ -1020,7 +1034,12 @@ async function requestVariableUpdateSecondPassWithTimeout(
   });
 
   try {
-    return await requestVariableUpdateSecondPass(input, assistantContentText, timedSignal.signal);
+    return await requestVariableUpdateSecondPass(
+      input,
+      assistantContentText,
+      timedSignal.signal,
+      applyRetryFeedback,
+    );
   } catch (error) {
     if (signal.aborted) {
       throw error;
@@ -1038,6 +1057,103 @@ async function requestVariableUpdateSecondPassWithTimeout(
 
 export function cancelStandaloneLocalTurn(): void {
   activeStandaloneTurnController?.abort();
+}
+
+/**
+ * 执行二段变量更新并把补丁应用到基线状态上，共享于两条链路：
+ * 正常回合收尾（finalizeVariableUpdate）与手动刷新（runStandaloneVariableUpdatePass）。
+ *
+ * 「拿到了 <UpdateVariable> 块、但逐条应用失败」时（典型：AI 引用了快照里不存在的路径，
+ * 如待办条目标题对不上），携带失败原因与原补丁向辅助 API 纠错重试一次；重试仍失败则
+ * 维持原有的「整批作废 + 警告」语义，不掩盖真正的路径错误。
+ */
+async function runSecondPassVariableUpdateWithApplyRetry(input: {
+  turnInput: StandaloneLocalTurnInput;
+  /** 已剥掉旧 <UpdateVariable> 块的正文原文；每轮补丁块都会拼回它上面再整体解析应用 */
+  baseRawReply: string;
+  signal: AbortSignal;
+  /** 逐条应用补丁的基线状态（重试请求也用它拼快照，保证 AI 看到的与最终应用的一致） */
+  baseStatData: StandaloneStatData;
+}): Promise<{
+  /** 成功应用的补丁结果；null 表示本回合未应用（块缺失/应用失败/空补丁） */
+  applyResult: VariableUpdateApplyResult | null;
+  /** 正文 + 本轮补丁块拼回后的完整回复原文；未应用时为 null */
+  effectiveRawReply: string | null;
+  warning: string | null;
+  status: Exclude<StandaloneVariableUpdateStatus, 'running'>;
+  variableUpdateApiLabel: string | null;
+  debugTrace: StandaloneAssistantDebugTrace | undefined;
+}> {
+  const { turnInput, baseRawReply, signal, baseStatData } = input;
+  const assistantContentText = parseTaggedAssistantReply(baseRawReply).contentText.trim();
+
+  let variableUpdateApiLabel: string | null = null;
+  let debugTrace: StandaloneAssistantDebugTrace | undefined;
+  let currentApplyRetryFeedback: VariableUpdateApplyRetryFeedback | null = null;
+
+  for (let attempt = 0; ; attempt += 1) {
+    const secondPassResult = await requestVariableUpdateSecondPassWithTimeout(
+      {
+        ...turnInput,
+        statData: baseStatData,
+      },
+      assistantContentText,
+      signal,
+      currentApplyRetryFeedback,
+    );
+    variableUpdateApiLabel = secondPassResult.usedApiLabel;
+    if (secondPassResult.debugTrace) {
+      debugTrace = mergeStandaloneAssistantDebugTrace(debugTrace, {
+        variable_update_pass: secondPassResult.debugTrace,
+      });
+    }
+
+    if (!secondPassResult.updateBlock) {
+      return {
+        applyResult: null,
+        effectiveRawReply: null,
+        warning: secondPassResult.warning ?? '补写变量更新失败',
+        status: secondPassResult.warning ? 'failed' : 'skipped',
+        variableUpdateApiLabel,
+        debugTrace,
+      };
+    }
+
+    const mergedRawReply = replaceOrAppendUpdateVariableBlock(baseRawReply, secondPassResult.updateBlock);
+    const mergedApplyResult = applyVariableUpdateFromReply(baseStatData, mergedRawReply);
+
+    if (!mergedApplyResult.errorMessage) {
+      return {
+        applyResult: mergedApplyResult,
+        effectiveRawReply: mergedRawReply,
+        warning: null,
+        status: mergedApplyResult.variableUpdateApplied ? 'success' : 'skipped',
+        variableUpdateApiLabel,
+        debugTrace,
+      };
+    }
+
+    if (attempt >= STANDALONE_VARIABLE_UPDATE_APPLY_RETRY_LIMIT) {
+      return {
+        applyResult: null,
+        effectiveRawReply: null,
+        warning: mergedApplyResult.errorMessage,
+        status: 'failed',
+        variableUpdateApiLabel,
+        debugTrace,
+      };
+    }
+
+    // 本轮应用失败但还有重试额度：把失败原因与原补丁打包成纠错回执，供下一轮请求注入提示词。
+    currentApplyRetryFeedback = {
+      errorMessage: mergedApplyResult.errorMessage,
+      failedPatchText: extractJsonPatchTextFromUpdateBlock(secondPassResult.updateBlock),
+    };
+    console.warn(
+      `[StandaloneLocalTurn] 变量更新补丁应用失败，将携带错误回执重试（第 ${attempt + 1} 次）：`,
+      mergedApplyResult.errorMessage,
+    );
+  }
 }
 
 export async function runStandaloneLocalTurn(input: StandaloneLocalTurnInput): Promise<StandaloneLocalTurnOutcome> {
@@ -1105,37 +1221,25 @@ export async function runStandaloneLocalTurn(input: StandaloneLocalTurnInput): P
           let debugTrace = mainDebugTrace;
 
           try {
-            const secondPassResult = await requestVariableUpdateSecondPassWithTimeout(
-              input,
-              assistantContentText,
-              controller.signal,
-            );
-            variableUpdateApiLabel = secondPassResult.usedApiLabel;
-            if (secondPassResult.debugTrace) {
-              debugTrace = mergeStandaloneAssistantDebugTrace(debugTrace, {
-                variable_update_pass: secondPassResult.debugTrace,
-              });
-            }
+            const secondPassOutcome = await runSecondPassVariableUpdateWithApplyRetry({
+              turnInput: input,
+              baseRawReply: sanitizedMainReply,
+              signal: controller.signal,
+              baseStatData: input.statData,
+            });
+            variableUpdateApiLabel = secondPassOutcome.variableUpdateApiLabel;
+            debugTrace = mergeStandaloneAssistantDebugTrace(debugTrace, {
+              variable_update_pass: secondPassOutcome.debugTrace?.variable_update_pass,
+            });
 
-            if (!secondPassResult.updateBlock) {
-              variableUpdateWarning = secondPassResult.warning ?? '补写变量更新失败';
-              variableUpdateStatus = variableUpdateWarning ? 'failed' : 'skipped';
+            if (secondPassOutcome.applyResult) {
+              applyResult = secondPassOutcome.applyResult;
+              effectiveRawReply = secondPassOutcome.effectiveRawReply ?? sanitizedMainReply;
+              variableUpdateWarning = null;
+              variableUpdateStatus = secondPassOutcome.status;
             } else {
-              const mergedRawReply = replaceOrAppendUpdateVariableBlock(
-                sanitizedMainReply,
-                secondPassResult.updateBlock,
-              );
-              const mergedApplyResult = applyVariableUpdateFromReply(input.statData, mergedRawReply);
-
-              if (mergedApplyResult.errorMessage) {
-                variableUpdateWarning = mergedApplyResult.errorMessage;
-                variableUpdateStatus = 'failed';
-              } else {
-                applyResult = mergedApplyResult;
-                effectiveRawReply = mergedRawReply;
-                variableUpdateWarning = null;
-                variableUpdateStatus = applyResult.variableUpdateApplied ? 'success' : 'skipped';
-              }
+              variableUpdateWarning = secondPassOutcome.warning;
+              variableUpdateStatus = secondPassOutcome.status;
             }
           } catch (error) {
             if (controller.signal.aborted) {

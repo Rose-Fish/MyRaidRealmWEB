@@ -86,6 +86,12 @@ export function parseTaggedAssistantReply(rawContent: string): ParsedTaggedAssis
   working = actionOptionsTags.cleaned;
   const { updateAnalysis, updateJsonPatchText } = parseUpdateVariableDetails(updateTags.content);
 
+  // 兜底正文走到这里说明成对提取已失败（典型：开标签有、闭标签没有）。
+  // 成对的 contenttext 保留其内部文本，落单的开/闭标签直接移除，避免标签字面量漏进正文。
+  working = working
+    .replace(/<contenttext\b[^>]*>([\s\S]*?)<\/contenttext>/gi, '$1')
+    .replace(/<\/?contenttext\b[^>]*>/gi, '');
+
   return {
     rawContent,
     contentText: extractTaggedContentText(rawContent),

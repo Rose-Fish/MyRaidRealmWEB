@@ -21,6 +21,7 @@ import {
   type StandaloneLocalContentRenderContext,
 } from '../../src/utils/standaloneLocalContentEjs';
 import { useMessagesStore, type MessageRecord } from '../../src/stores/messages';
+import { parseTaggedAssistantReply } from '../../src/utils/taggedReply';
 import {
   applyOnlineModeToStandaloneLocalContent,
   applyTextToImageToStandaloneLocalContent,
@@ -485,6 +486,21 @@ function testStandaloneTavernMacroState(): void {
   assert.equal(second, ' ROOT-BODY');
 
   assert.equal(applyStandaloneTavernMacroState('{{getvar::missing}}', state), '');
+}
+
+function testTaggedReplyFallbackStripsStrayContenttextTags(): void {
+  // 场景一：只有开标签没有闭标签（典型截断），标签字面量不能漏进兜底正文
+  const unclosed = parseTaggedAssistantReply('<analysis_block>分析</analysis_block>\n<contenttext>\n正文开始');
+  assert.equal(unclosed.contentText, '');
+  assert.equal(unclosed.fallbackContentText, '正文开始');
+
+  // 场景二：成对但正文提取前其他标签已剥离，成对 contenttext 应保留内部文本
+  const paired = parseTaggedAssistantReply('<summary>总结</summary>\n<contenttext>真正的正文</contenttext>');
+  assert.equal(paired.fallbackContentText, '真正的正文');
+
+  // 场景三：落单的闭标签也要移除
+  const strayClose = parseTaggedAssistantReply('正文写完了\n</contenttext>');
+  assert.equal(strayClose.fallbackContentText, '正文写完了');
 }
 
 function testPriorSummariesOutsideRecentWindowAreInjected(): void {
@@ -3250,6 +3266,147 @@ async function testStandaloneLocalTurnExposesMainReplyBeforeVariableUpdateComple
   }
 }
 
+async function testStandaloneLocalTurnRetriesVariableUpdateWhenPatchApplyFails(): Promise<void> {
+  const originalFetch = globalThis.fetch;
+  const secondPassRequestBodies: any[] = [];
+
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body ?? '{}'));
+
+    if (isStandaloneVariableUpdateRequest(body)) {
+      secondPassRequestBodies.push(body);
+
+      // 第一次：引用快照里不存在的待办条目（复现 Parent path does not exist 报错）。
+      // 第二次：修正为对现有字段的合法 replace。
+      const isFirstAttempt = secondPassRequestBodies.length === 1;
+      const patchText = isFirstAttempt
+        ? '{"op":"replace","path":"/玩家/记事本/待办事项/不存在的待办条目/状态","value":"已完成"}'
+        : '{"op":"replace","path":"/玩家/姓名","value":"重试成功"}';
+
+      return createMockFetchResponse({
+        jsonData: {
+          choices: [
+            {
+              message: {
+                content: `<UpdateVariable><Analysis>only english analysis here</Analysis><JSONPatch>[${patchText}]</JSONPatch></UpdateVariable>`,
+              },
+            },
+          ],
+        },
+      });
+    }
+
+    return createMockFetchResponse({
+      jsonData: {
+        choices: [
+          {
+            message: {
+              content: '<contenttext>正文内容</contenttext><action_options>1. 继续</action_options>',
+            },
+          },
+        ],
+      },
+    });
+  }) as typeof fetch;
+
+  try {
+    const outcome = await runStandaloneLocalTurn(
+      createStandaloneTurnInput({
+        assistantApis: [
+          {
+            ...createDefaultApiConfig(),
+            apiurl: 'https://assistant-retry.example.com/v1/chat/completions',
+            key: 'assistant-retry-key',
+            model: 'assistant-retry-model',
+            source: 'openai_compatible',
+          },
+        ],
+      }),
+    );
+
+    const finalized = await outcome.finalizeVariableUpdate;
+
+    // 重试后成功应用，不再整批作废
+    assert.equal(finalized.variableUpdateStatus, 'success');
+    assert.equal(finalized.variableUpdateWarning, null);
+    assert.equal(finalized.nextStatData.玩家.姓名, '重试成功');
+
+    // 恰好请求了两次（首次 + 携带错误回执的重试）
+    assert.equal(secondPassRequestBodies.length, 2);
+
+    // 重试请求里注入了失败原因与原补丁的纠错回执
+    const retryMessages = secondPassRequestBodies[1]?.messages as Array<{ content?: string }>[];
+    const retrySystemPrompt = retryMessages?.find(message => message.content?.includes('[Meta.System]'))?.content ?? '';
+    assert.ok(retrySystemPrompt.includes('补丁纠错重试'), '重试请求应包含纠错回执指令');
+    assert.ok(retrySystemPrompt.includes('不存在的待办条目'), '重试请求应包含失败路径');
+    assert.ok(retrySystemPrompt.includes('Parent path does not exist'), '重试请求应包含失败原因');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function testStandaloneLocalTurnDoesNotRetryForeverWhenPatchKeepsFailing(): Promise<void> {
+  const originalFetch = globalThis.fetch;
+  let secondPassRequestCount = 0;
+
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body ?? '{}'));
+
+    if (isStandaloneVariableUpdateRequest(body)) {
+      secondPassRequestCount += 1;
+      return createMockFetchResponse({
+        jsonData: {
+          choices: [
+            {
+              message: {
+                content:
+                  '<UpdateVariable><Analysis>only english analysis here</Analysis><JSONPatch>[{"op":"replace","path":"/玩家/记事本/待办事项/始终不存在/状态","value":"已完成"}]</JSONPatch></UpdateVariable>',
+              },
+            },
+          ],
+        },
+      });
+    }
+
+    return createMockFetchResponse({
+      jsonData: {
+        choices: [
+          {
+            message: {
+              content: '<contenttext>正文内容</contenttext><action_options>1. 继续</action_options>',
+            },
+          },
+        ],
+      },
+    });
+  }) as typeof fetch;
+
+  try {
+    const outcome = await runStandaloneLocalTurn(
+      createStandaloneTurnInput({
+        assistantApis: [
+          {
+            ...createDefaultApiConfig(),
+            apiurl: 'https://assistant-retry-limit.example.com/v1/chat/completions',
+            key: 'assistant-retry-limit-key',
+            model: 'assistant-retry-limit-model',
+            source: 'openai_compatible',
+          },
+        ],
+      }),
+    );
+
+    const finalized = await outcome.finalizeVariableUpdate;
+
+    // 重试额度用尽后维持「整批作废 + 警告」语义，不会无限重试
+    assert.equal(finalized.variableUpdateStatus, 'failed');
+    assert.ok(finalized.variableUpdateWarning?.includes('Parent path does not exist'));
+    assert.equal(secondPassRequestCount, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
 async function testStandaloneLocalTurnStreamsPartialMainReplyBeforeCompletion(): Promise<void> {
   const originalFetch = globalThis.fetch;
   const streamedSnapshots: string[] = [];
@@ -4888,6 +5045,7 @@ async function run(): Promise<void> {
     ['supports getvar defaults and lodash random', testSupportsGetvarDefaultsAndLodashRandom],
     ['standalone prompt macro helpers', testStandalonePromptMacroReplacementHelpers],
     ['standalone Tavern variable macro state', testStandaloneTavernMacroState],
+    ['tagged reply fallback strips stray contenttext tags', testTaggedReplyFallbackStripsStrayContenttextTags],
     ['prior summaries outside recent window are injected', testPriorSummariesOutsideRecentWindowAreInjected],
     ['stage summary replaces archived prior summaries', testStageSummaryReplacesArchivedPriorSummaries],
     ['stage summary threshold normalization', testStageSummaryThresholdNormalization],
@@ -5028,6 +5186,14 @@ async function run(): Promise<void> {
     [
       'standalone local turn exposes main reply before variable update completes',
       testStandaloneLocalTurnExposesMainReplyBeforeVariableUpdateCompletes,
+    ],
+    [
+      'standalone local turn retries variable update when patch apply fails',
+      testStandaloneLocalTurnRetriesVariableUpdateWhenPatchApplyFails,
+    ],
+    [
+      'standalone local turn does not retry forever when patch keeps failing',
+      testStandaloneLocalTurnDoesNotRetryForeverWhenPatchKeepsFailing,
     ],
     [
       'standalone local turn streams partial main reply before completion',
